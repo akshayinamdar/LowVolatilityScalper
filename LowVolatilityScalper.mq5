@@ -121,6 +121,9 @@ void ScheduleNextCheck()
     
     nextCheckTime = TimeCurrent() + (minutesToNext * 60);
     lastCheckTime = TimeCurrent();
+
+    string nextCheckTimeStr = TimeToString(nextCheckTime, TIME_DATE|TIME_MINUTES);
+    Print("Next market check scheduled at: ", nextCheckTimeStr, " (in ", minutesToNext, " minutes)");
 }
 
 //+------------------------------------------------------------------+
@@ -131,9 +134,17 @@ bool IsWithinTradingHours()
     MqlDateTime dt;
     TimeToStruct(TimeCurrent(), dt);
     
-    string currentTimeStr = StringFormat("%02d:%02d", dt.hour, dt.min);
+    // Convert string times to comparable format
+    int startHour = (int)StringToInteger(StringSubstr(DailyStartTime, 0, 2));
+    int startMinute = (int)StringToInteger(StringSubstr(DailyStartTime, 3, 2));
+    int endHour = (int)StringToInteger(StringSubstr(DailyEndTime, 0, 2));
+    int endMinute = (int)StringToInteger(StringSubstr(DailyEndTime, 3, 2));
     
-    return (currentTimeStr >= DailyStartTime && currentTimeStr <= DailyEndTime);
+    int currentMinutes = dt.hour * 60 + dt.min;
+    int startMinutes = startHour * 60 + startMinute;
+    int endMinutes = endHour * 60 + endMinute;
+    
+    return (currentMinutes >= startMinutes && currentMinutes <= endMinutes);
 }
 
 //+------------------------------------------------------------------+
@@ -169,15 +180,16 @@ bool IsLowVolatilityPeriod()
     double high = 0, low = DBL_MAX;
     
     // Get high and low for the last VolatilityPeriod minutes
-    for(int i = 0; i < VolatilityPeriod; i++)
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    int copied = CopyRates(_Symbol, PERIOD_M1, 0, VolatilityPeriod, rates);
+    
+    if(copied > 0)
     {
-        double rates[][6];
-        int copied = CopyRates(_Symbol, PERIOD_M1, i, 1, rates);
-        
-        if(copied > 0)
+        for(int i = 0; i < copied; i++)
         {
-            if(rates[0][2] > high) high = rates[0][2]; // High
-            if(rates[0][3] < low) low = rates[0][3];   // Low
+            if(rates[i].high > high) high = rates[i].high;
+            if(rates[i].low < low) low = rates[i].low;
         }
     }
     
@@ -192,7 +204,7 @@ bool IsLowVolatilityPeriod()
         double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
         double midPoint = (high + low) / 2;
         double distanceFromMid = MathAbs(currentPrice - midPoint);
-        double maxDistanceForEntry = (high - low) * 0.3; // Within 30% of range center
+        double maxDistanceForEntry = (high - low) * 0.6; // Within 60% of range center
         
         return (distanceFromMid <= maxDistanceForEntry);
     }
@@ -271,8 +283,14 @@ int GetCurrentPositionCount()
     
     for(int i = 0; i < PositionsTotal(); i++)
     {
-        if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == 12345)
-            count++;
+        if(PositionSelectByTicket(PositionGetTicket(i)))
+        {
+            string posSymbol = PositionGetString(POSITION_SYMBOL);
+            ulong posMagic = PositionGetInteger(POSITION_MAGIC);
+            
+            if(posSymbol == _Symbol && posMagic == 12345)
+                count++;
+        }
     }
     
     return count;
@@ -295,9 +313,31 @@ void MonitorPositions()
 //+------------------------------------------------------------------+
 void CloseAllPositions()
 {
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    // Store position tickets first to avoid index issues
+    ulong tickets[];
+    int count = 0;
+    
+    // Collect tickets of positions to close
+    for(int i = 0; i < PositionsTotal(); i++)
     {
-        if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == 12345)
+        if(PositionSelectByTicket(PositionGetTicket(i)))
+        {
+            string posSymbol = PositionGetString(POSITION_SYMBOL);
+            ulong posMagic = PositionGetInteger(POSITION_MAGIC);
+            
+            if(posSymbol == _Symbol && posMagic == 12345)
+            {
+                ArrayResize(tickets, count + 1);
+                tickets[count] = PositionGetTicket(i);
+                count++;
+            }
+        }
+    }
+    
+    // Close positions using stored tickets
+    for(int i = 0; i < count; i++)
+    {
+        if(PositionSelectByTicket(tickets[i]))
         {
             MqlTradeRequest request;
             MqlTradeResult result;
