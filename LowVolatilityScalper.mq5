@@ -30,11 +30,16 @@ input int VolatilityRange = 15;              // Maximum range in pips
 input group "Risk Management"
 input double MaxRiskPercent = 2.0;           // Maximum risk per trade (%)
 
+input group "Trailing Stop Settings"
+input int TrailingActivationPips = 2.0;       // Activate after X pips profit
+input double TrailingPercent = 50.0;        // Trail by % of profit (50=half)
+
 //--- Global Variables
 int dailyTradeCount = 0;
 datetime lastCheckTime = 0;
 datetime nextCheckTime = 0;
 datetime currentDay = 0;
+int fractalHandle;        // Handle for the fractal indicator
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -52,6 +57,13 @@ int OnInit()
         MathSrand(GetTickCount());
     }
     
+    // Initialize Fractal indicator
+    fractalHandle = iFractals(_Symbol, PERIOD_M1);
+    if(fractalHandle == INVALID_HANDLE) {
+        Print("Failed to create Fractals indicator handle");
+        return INIT_FAILED;
+    }
+    
     // Set next check time
     ScheduleNextCheck();
     
@@ -63,6 +75,10 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    // Release indicator handle
+    if(fractalHandle != INVALID_HANDLE)
+        IndicatorRelease(fractalHandle);
+    
     Print("Low Volatility Scalper EA deinitialized. Reason: ", reason);
 }
 
@@ -161,14 +177,21 @@ void CheckMarketConditions()
         
     if(GetCurrentPositionCount() >= MaxConcurrentTrades)
         return;
-    
-    // Check volatility conditions
+      // Check volatility conditions
     if(IsLowVolatilityPeriod())
     {
-        // Random direction selection
-        bool isLong = (MathRand() % 2 == 0);
+        // Get direction from fractals instead of random selection
+        int direction = GetFractalDirection();
         
-        PlaceTrade(isLong);
+        if(direction != 0)
+        {
+            bool isLong = (direction > 0);
+            PlaceTrade(isLong);
+        }
+        else
+        {
+            Print("No clear fractal signal detected. Skipping trade opportunity.");
+        }
     }
 }
 
@@ -192,24 +215,71 @@ bool IsLowVolatilityPeriod()
             if(rates[i].low < low) low = rates[i].low;
         }
     }
-    
-    // Calculate range in pips
+      // Calculate range in pips
     double rangePips = (high - low) / _Point;
     if(_Digits == 5 || _Digits == 3) rangePips /= 10;
     
     // Check if range is within our volatility threshold
     if(rangePips <= VolatilityRange)
     {
-        // Check if current price is near middle of range
+        // Calculate boundaries for middle 60% of the range
+        double rangeWidth = high - low;
+        double lowerBoundary = low + (rangeWidth * 0.2);  // 20% from bottom
+        double upperBoundary = high - (rangeWidth * 0.2); // 20% from top
         double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-        double midPoint = (high + low) / 2;
-        double distanceFromMid = MathAbs(currentPrice - midPoint);
-        double maxDistanceForEntry = (high - low) * 0.6; // Within 60% of range center
+         
+        Print("Volatility Check - Range High: ", high, ", Range Low: ", low, ", Range Pips: ", rangePips);
+        Print("Middle 60% Boundaries - Lower: ", lowerBoundary, ", Upper: ", upperBoundary, ", Current Price: ", currentPrice);
+        // Check if price is within the middle 60%
+        bool isWithinMiddle60Percent = (currentPrice >= lowerBoundary && currentPrice <= upperBoundary);
         
-        return (distanceFromMid <= maxDistanceForEntry);
+        return isWithinMiddle60Percent;
     }
     
     return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get direction based on fractal pattern                          |
+//+------------------------------------------------------------------+
+int GetFractalDirection()
+{
+    // Buffer 0 = Upper fractals, Buffer 1 = Lower fractals
+    double upperFractals[];
+    double lowerFractals[];
+    
+    // Set as series for proper indexing (newest bars first)
+    ArraySetAsSeries(upperFractals, true);
+    ArraySetAsSeries(lowerFractals, true);
+    
+    // Copy the most recent 10 bars of fractal data
+    if(CopyBuffer(fractalHandle, 0, 0, 10, upperFractals) <= 0 ||
+       CopyBuffer(fractalHandle, 1, 0, 10, lowerFractals) <= 0) {
+        Print("Error getting fractal data: ", GetLastError());
+        return 0;
+    }
+    
+    // Find the most recent fractal
+    // Note: A value of EMPTY_VALUE means no fractal, any other value means a fractal
+    for(int i = 2; i < 15; i++) // Start at index 2 since fractals need confirmation
+    {
+        // If we found an upper fractal
+        if(upperFractals[i] != EMPTY_VALUE)
+        {
+            Print("Found upper fractal at bar ", i, " - expecting bearish move");
+            return -1; // Sell signal
+        }
+        
+        // If we found a lower fractal
+        if(lowerFractals[i] != EMPTY_VALUE)
+        {
+            Print("Found lower fractal at bar ", i, " - expecting bullish move");
+            return 1; // Buy signal
+        }
+    }
+    
+    // No recent fractals found
+    return 0;
 }
 
 //+------------------------------------------------------------------+
@@ -304,20 +374,21 @@ void MonitorPositions()
     // Check if we need to close positions at end of day
     if(!IsWithinTradingHours())
     {
-        CloseAllPositions();
+        return;
     }
+    
+    // Always process trailing stops
+    ManageTrailingStops();
 }
 
 //+------------------------------------------------------------------+
-//| Close all positions at end of trading day                       |
+//| Manage trailing stops for all open positions                     |
 //+------------------------------------------------------------------+
-void CloseAllPositions()
+void ManageTrailingStops()
 {
-    // Store position tickets first to avoid index issues
-    ulong tickets[];
-    int count = 0;
+    double pipValue = _Point;
+    if(_Digits == 5 || _Digits == 3) pipValue *= 10;
     
-    // Collect tickets of positions to close
     for(int i = 0; i < PositionsTotal(); i++)
     {
         if(PositionSelectByTicket(PositionGetTicket(i)))
@@ -325,38 +396,103 @@ void CloseAllPositions()
             string posSymbol = PositionGetString(POSITION_SYMBOL);
             ulong posMagic = PositionGetInteger(POSITION_MAGIC);
             
+            // Only process our own positions on the current symbol
             if(posSymbol == _Symbol && posMagic == 12345)
             {
-                ArrayResize(tickets, count + 1);
-                tickets[count] = PositionGetTicket(i);
-                count++;
+                double currentSL = PositionGetDouble(POSITION_SL);
+                double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                double currentPrice = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 
+                                     SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                                     SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                
+                // Calculate profit in pips
+                double profitPips;
+                if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                {
+                    profitPips = (currentPrice - openPrice) / pipValue;
+                }
+                else
+                {
+                    profitPips = (openPrice - currentPrice) / pipValue;
+                }
+                
+                // Only apply trailing stop if we've reached activation threshold
+                if(profitPips >= TrailingActivationPips)
+                {
+                    // Calculate trailing distance as percentage of profit
+                    double trailingDistancePips = profitPips * (TrailingPercent / 100.0);
+                    
+                    // Ensure minimum trail distance of 1 pip
+                    if(trailingDistancePips < 1.0) trailingDistancePips = 1.0;
+                    
+                    double newSL;
+                    bool modifyNeeded = false;
+                    
+                    if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                    {
+                        // For buy positions, trail below the current price
+                        newSL = currentPrice - (trailingDistancePips * pipValue);
+                        
+                        // Only modify if the new SL is higher than the current one
+                        if(newSL > currentSL)
+                            modifyNeeded = true;
+                    }
+                    else
+                    {
+                        // For sell positions, trail above the current price
+                        newSL = currentPrice + (trailingDistancePips * pipValue);
+                        
+                        // Only modify if the new SL is lower than the current one
+                        if(newSL < currentSL || currentSL == 0)
+                            modifyNeeded = true;
+                    }
+                    
+                    // Update the stop loss if needed
+                    if(modifyNeeded)
+                    {
+                        Print("Updating trailing stop for position #", PositionGetTicket(i), 
+                              " Current profit: ", profitPips, " pips",
+                              " Trail distance: ", trailingDistancePips, " pips");
+                        ModifyStopLoss(PositionGetTicket(i), newSL);
+                    }
+                }
             }
         }
     }
+}
+
+//+------------------------------------------------------------------+
+//| Modify stop loss for a position                                  |
+//+------------------------------------------------------------------+
+bool ModifyStopLoss(ulong ticket, double newSL)
+{
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
     
-    // Close positions using stored tickets
-    for(int i = 0; i < count; i++)
+    request.action = TRADE_ACTION_SLTP;
+    request.position = ticket;
+    request.symbol = _Symbol;
+    request.sl = newSL;
+    request.tp = PositionGetDouble(POSITION_TP); // Keep the same TP
+    
+    if(OrderSend(request, result))
     {
-        if(PositionSelectByTicket(tickets[i]))
+        if(result.retcode == TRADE_RETCODE_DONE)
         {
-            MqlTradeRequest request;
-            MqlTradeResult result;
-            ZeroMemory(request);
-            ZeroMemory(result);
-            
-            request.action = TRADE_ACTION_DEAL;
-            request.symbol = _Symbol;
-            request.volume = PositionGetDouble(POSITION_VOLUME);
-            request.type = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 
-                          ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-            request.price = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ?
-                           SymbolInfoDouble(_Symbol, SYMBOL_BID) :
-                           SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            request.deviation = 3;
-            request.magic = 12345;
-            request.comment = "EOD Close";
-            
-            OrderSend(request, result);
+            Print("Trailing stop updated for ticket #", ticket, " to ", newSL);
+            return true;
+        }
+        else
+        {
+            Print("Failed to update trailing stop. Error code: ", result.retcode);
         }
     }
+    else
+    {
+        Print("OrderSend failed. Error: ", GetLastError());
+    }
+    
+    return false;
 }
