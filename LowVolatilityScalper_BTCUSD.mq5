@@ -15,10 +15,8 @@ input string DailyStartTime = "00:00";       // Daily start time (HH:MM)
 input string DailyEndTime = "23:59";         // Daily end time (HH:MM)
 
 input group "Market Checking Mechanism"
-input int CheckFrequency = 2;                // Checks per hour
-input bool RandomCheckWindow = true;         // Enable random check times
-input int MinTimeBetweenChecks = 15;         // Min minutes between checks
-input int MaxTimeBetweenChecks = 40;         // Max minutes between checks
+input int CheckIntervalMinutes = 15;         // Check market every X minutes
+input bool VerifyLowVolatility = true;       // Enable low volatility verification
 
 input group "Trading Parameters"
 input double LotSize = 0.001;                // Position size (smaller for BTC)
@@ -28,10 +26,8 @@ input int VolatilityPeriod = 60;             // Minutes to check volatility
 input int VolatilityRange = 200;             // Maximum range in points (wider for BTC)
 
 input group "Moving Average Settings"
-input int MAPeriod = 50;                     // Moving Average period
 input ENUM_MA_METHOD MAMethod = MODE_EMA;    // Moving Average method
 input ENUM_TIMEFRAMES MATimeframe = PERIOD_M15; // Timeframe for MA calculation
-input bool EnableMASignal = true;           // Enable moving average signals
 
 input group "Risk Management"
 input double MaxRiskPercent = 1.0;           // Maximum risk per trade (%)
@@ -45,6 +41,7 @@ int dailyTradeCount = 0;
 datetime lastCheckTime = 0;
 datetime nextCheckTime = 0;
 datetime currentDay = 0;
+int currentMAPeriod = 50;                    // Current randomized MA period
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -61,9 +58,11 @@ int OnInit()
         // Live trading seed
         MathSrand(GetTickCount());
     }
-    
-    // Set next check time
+      // Set next check time
     ScheduleNextCheck();
+    
+    // Initialize random MA period
+    RandomizeMA();
     
     return(INIT_SUCCEEDED);
 }
@@ -115,25 +114,24 @@ void CheckNewDay()
 //+------------------------------------------------------------------+
 void ScheduleNextCheck()
 {
-    int minutesToNext;
-    
-    if(RandomCheckWindow)
-    {
-        // Random interval between min and max
-        minutesToNext = MinTimeBetweenChecks + 
-                       MathRand() % (MaxTimeBetweenChecks - MinTimeBetweenChecks + 1);
-    }
-    else
-    {
-        // Fixed interval based on frequency
-        minutesToNext = 60 / CheckFrequency;
-    }
+    // Fixed interval check every X minutes
+    int minutesToNext = CheckIntervalMinutes;
     
     nextCheckTime = TimeCurrent() + (minutesToNext * 60);
     lastCheckTime = TimeCurrent();
 
     string nextCheckTimeStr = TimeToString(nextCheckTime, TIME_DATE|TIME_MINUTES);
     Print("Next market check scheduled at: ", nextCheckTimeStr, " (in ", minutesToNext, " minutes)");
+}
+
+//+------------------------------------------------------------------+
+//| Randomize Moving Average period                                  |
+//+------------------------------------------------------------------+
+void RandomizeMA()
+{
+    // Generate random MA period between 1 and 60
+    currentMAPeriod = 1 + (MathRand() % 60);
+    Print("New random MA period selected: ", currentMAPeriod);
 }
 
 //+------------------------------------------------------------------+
@@ -170,31 +168,36 @@ void CheckMarketConditions()
         return;
         
     if(GetCurrentPositionCount() >= MaxConcurrentTrades)
-        return;    // Check volatility conditions
-    if(IsLowVolatilityPeriod())
+        return;
+    
+    // Randomize MA period for each check
+    RandomizeMA();
+    
+    // Check volatility conditions if enabled
+    bool volatilityOK = true;
+    if(VerifyLowVolatility)
     {
-        // Use moving average strategy instead of random
-        if(EnableMASignal)
+        volatilityOK = IsLowVolatilityPeriod();
+        if(!volatilityOK)
         {
-            int direction = GetMASignal();
-            if(direction != 0) // 0 = no signal, 1 = long, -1 = short
-            {
-                bool isLong = (direction == 1);
-                PlaceTrade(isLong);
-                Print("Low volatility detected. MA signal: ", isLong ? "LONG" : "SHORT");
-            }
-            else
-            {
-                Print("Low volatility detected but no clear MA signal");
-            }
+            Print("High volatility detected, skipping trade");
+            return;
         }
-        else
-        {
-            // Fallback to random direction if MA signal is disabled
-            bool isLong = (MathRand() % 2 == 0);
-            PlaceTrade(isLong);
-            Print("Low volatility detected. Random direction selected: ", isLong ? "LONG" : "SHORT");
-        }
+    }
+    
+    // Get MA signal direction
+    int direction = GetMASignal();
+    if(direction != 0) // 0 = no signal, 1 = long, -1 = short
+    {
+        bool isLong = (direction == 1);
+        PlaceTrade(isLong);
+        
+        string volatilityMsg = VerifyLowVolatility ? "Low volatility confirmed. " : "Volatility check disabled. ";
+        Print(volatilityMsg, "MA signal (period ", currentMAPeriod, "): ", isLong ? "LONG" : "SHORT");
+    }
+    else
+    {
+        Print("No clear MA signal (period ", currentMAPeriod, ")");
     }
 }
 
@@ -598,10 +601,10 @@ int GetMASignal()
     double maValues[];
     ArraySetAsSeries(maValues, true);
     
-    int maHandle = iMA(_Symbol, MATimeframe, MAPeriod, 0, MAMethod, PRICE_CLOSE);
+    int maHandle = iMA(_Symbol, MATimeframe, currentMAPeriod, 0, MAMethod, PRICE_CLOSE);
     if(maHandle == INVALID_HANDLE)
     {
-        Print("Failed to create Moving Average indicator");
+        Print("Failed to create Moving Average indicator with period ", currentMAPeriod);
         return 0; // No signal
     }
     
@@ -616,7 +619,7 @@ int GetMASignal()
     double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double currentMA = maValues[0];
     
-    Print("BTC Moving Average - MA Value: ", currentMA, ", Current Price: ", currentPrice);
+    Print("BTC Moving Average (period ", currentMAPeriod, ") - MA Value: ", currentMA, ", Current Price: ", currentPrice);
     
     // Simple trend following signals
     if(currentPrice > currentMA)
