@@ -204,7 +204,8 @@ void CheckMarketConditions()
 bool IsLowVolatilityPeriod()
 {
     double high = 0, low = DBL_MAX;
-    
+    int highIndex = -1, lowIndex = -1;
+
     // Get high and low for the last VolatilityPeriod minutes
     MqlRates rates[];
     ArraySetAsSeries(rates, true);
@@ -214,31 +215,50 @@ bool IsLowVolatilityPeriod()
     {
         for(int i = 0; i < copied; i++)
         {
-            if(rates[i].high > high) high = rates[i].high;
-            if(rates[i].low < low) low = rates[i].low;
+            if(rates[i].high > high) 
+            {
+                high = rates[i].high;
+                highIndex = i;  // Store index of candle with highest high
+            }
+            
+            if(rates[i].low < low) 
+            {
+                low = rates[i].low;
+                lowIndex = i;   // Store index of candle with lowest low
+            }
         }
     }
     
     // Calculate range in points (for BTC, we use _Point directly)
     double rangePoints = (high - low);
     
-    Print("BTC Volatility Check - Range High: ", high, ", Range Low: ", low, ", Range Points: ", rangePoints);
+    Print("BTC Volatility Check - Range High: ", high, " (index ", highIndex, 
+          "), Range Low: ", low, " (index ", lowIndex, "), Range Points: ", rangePoints);
     
+    bool rangeAgeValid = (highIndex >= 3 && lowIndex >= 3);
+    if(!rangeAgeValid)
+    {
+        Print("Range is too recent - high formed ", highIndex, " candles ago, low formed ", 
+              lowIndex, " candles ago. Need at least 3 candles of distance.");
+        return false;
+    }
+
+
     // Check if range is within our volatility threshold
     if(rangePoints <= VolatilityRange)
     {
         // Calculate boundaries for middle 60% of the range
         double rangeWidth = high - low;
-        double lowerBoundary = low + (rangeWidth * 0.2);  // 20% from bottom
-        double upperBoundary = high - (rangeWidth * 0.2); // 20% from top
+        double lowerBoundary = low + (rangeWidth * 0.24);  // 24% from bottom
+        double upperBoundary = high - (rangeWidth * 0.24); // 24% from top
         double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          
-        Print("BTC Middle 60% Boundaries - Lower: ", lowerBoundary, ", Upper: ", upperBoundary, ", Current Price: ", currentPrice);
+        Print("BTC Middle Boundaries - Lower: ", lowerBoundary, ", Upper: ", upperBoundary, ", Current Price: ", currentPrice);
         
         // Check if price is within the middle 60%
-        bool isWithinMiddle60Percent = (currentPrice >= lowerBoundary && currentPrice <= upperBoundary);
+        bool isWithinMiddlePercent = (currentPrice >= lowerBoundary && currentPrice <= upperBoundary);
         
-        return isWithinMiddle60Percent;
+        return isWithinMiddlePercent;
     }
     
     return false;
