@@ -27,12 +27,18 @@ input int StopLossPips = 100;                // Stop loss in points
 input int VolatilityPeriod = 60;             // Minutes to check volatility
 input int VolatilityRange = 200;             // Maximum range in points (wider for BTC)
 
+input group "Moving Average Settings"
+input int MAPeriod = 50;                     // Moving Average period
+input ENUM_MA_METHOD MAMethod = MODE_EMA;    // Moving Average method
+input ENUM_TIMEFRAMES MATimeframe = PERIOD_M15; // Timeframe for MA calculation
+input bool EnableMASignal = true;           // Enable moving average signals
+
 input group "Risk Management"
 input double MaxRiskPercent = 1.0;           // Maximum risk per trade (%)
 
 input group "Trailing Stop Settings"
 input double TrailingActivationPips = 25;   // Activate after X points profit
-input double TrailingPercent = 40.0;        // Trail by % of profit
+input double TrailingPercent = 69.69;        // Trail by % of profit
 
 //--- Global Variables
 int dailyTradeCount = 0;
@@ -164,15 +170,31 @@ void CheckMarketConditions()
         return;
         
     if(GetCurrentPositionCount() >= MaxConcurrentTrades)
-        return;
-    
-    // Check volatility conditions
+        return;    // Check volatility conditions
     if(IsLowVolatilityPeriod())
     {
-        // Use random direction selection
-        bool isLong = (MathRand() % 2 == 0); // Random true/false
-        PlaceTrade(isLong);
-        Print("Low volatility detected. Random direction selected: ", isLong ? "LONG" : "SHORT");
+        // Use moving average strategy instead of random
+        if(EnableMASignal)
+        {
+            int direction = GetMASignal();
+            if(direction != 0) // 0 = no signal, 1 = long, -1 = short
+            {
+                bool isLong = (direction == 1);
+                PlaceTrade(isLong);
+                Print("Low volatility detected. MA signal: ", isLong ? "LONG" : "SHORT");
+            }
+            else
+            {
+                Print("Low volatility detected but no clear MA signal");
+            }
+        }
+        else
+        {
+            // Fallback to random direction if MA signal is disabled
+            bool isLong = (MathRand() % 2 == 0);
+            PlaceTrade(isLong);
+            Print("Low volatility detected. Random direction selected: ", isLong ? "LONG" : "SHORT");
+        }
     }
 }
 
@@ -413,7 +435,7 @@ void ManageTrailingStops()
                     if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
                     {
                         // For buy positions, trail below the current price
-                        newSL = currentPrice - (trailingDistancePoints * pointValue);
+                        newSL = openPrice + (profitPoints * (TrailingPercent / 100.0) * pointValue);
                         
                         // Only modify if the new SL is higher than the current one
                         if(newSL > currentSL)
@@ -422,7 +444,7 @@ void ManageTrailingStops()
                     else
                     {
                         // For sell positions, trail above the current price
-                        newSL = currentPrice + (trailingDistancePoints * pointValue);
+                        newSL = openPrice - (profitPoints * (TrailingPercent / 100.0) * pointValue);
                         
                         // Only modify if the new SL is lower than the current one
                         if(newSL < currentSL || currentSL == 0)
@@ -546,3 +568,55 @@ void CloseAllPositions()
         }
     }
 }
+
+//+------------------------------------------------------------------+
+//| Get Moving Average Signal                                        |
+//+------------------------------------------------------------------+
+int GetMASignal()
+{
+    // Get Moving Average values
+    double maValues[];
+    ArraySetAsSeries(maValues, true);
+    
+    int maHandle = iMA(_Symbol, MATimeframe, MAPeriod, 0, MAMethod, PRICE_CLOSE);
+    if(maHandle == INVALID_HANDLE)
+    {
+        Print("Failed to create Moving Average indicator");
+        return 0; // No signal
+    }
+    
+    // Copy the indicator values
+    if(CopyBuffer(maHandle, 0, 0, 2, maValues) < 2)
+    {
+        Print("Failed to copy Moving Average data");
+        IndicatorRelease(maHandle);
+        return 0; // No signal
+    }
+    
+    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double currentMA = maValues[0];
+    
+    Print("BTC Moving Average - MA Value: ", currentMA, ", Current Price: ", currentPrice);
+    
+    // Simple trend following signals
+    if(currentPrice > currentMA)
+    {
+        Print("BTC MA signal: BUY (price above MA)");
+        IndicatorRelease(maHandle);
+        return 1; // Long signal
+    }
+    else if(currentPrice < currentMA)
+    {
+        Print("BTC MA signal: SELL (price below MA)");
+        IndicatorRelease(maHandle);
+        return -1; // Short signal
+    }
+    else
+    {
+        Print("BTC price exactly at MA, no clear signal");
+        IndicatorRelease(maHandle);
+        return 0; // No signal
+    }
+}
+
+//+------------------------------------------------------------------+
