@@ -21,6 +21,11 @@ input double FixedLotSize = 0.0;           // Fixed lot size (0 = auto calculate
 input int StopLossPips = 50;               // Stop loss in pips
 input int TakeProfitPips = 100;            // Take profit in pips
 
+input group "Trailing Stop Settings"
+input bool UseTrailingStop = true;         // Enable trailing stop
+input int TrailStartPoints = 20;           // Points in profit before trailing starts
+input double TrailPercent = 50.0;          // Percentage of profits to trail by (%)
+
 //--- Global Variables
 int dailyTradeCount = 0;
 datetime nextTradeTime = 0;
@@ -65,9 +70,14 @@ void OnTick()
 {
     // Check if it's a new day and reset counters
     CheckNewDay();
-    
-    // Update position status
+      // Update position status
     UpdatePositionStatus();
+    
+    // Check for trailing stop if position is open
+    if(hasOpenPosition && UseTrailingStop)
+    {
+        CheckTrailingStop();
+    }
     
     // Check if it's time to place a trade
     if(TimeCurrent() >= nextTradeTime && !hasOpenPosition)
@@ -308,10 +318,102 @@ void PlaceTrade(bool isLong)
         }
     }
     else
-    {
-        Print("OrderSend failed. Error: ", GetLastError());
+    {        Print("OrderSend failed. Error: ", GetLastError());
         // Reschedule next trade even if this one failed
         if(dailyTradeCount < MaxDailyTrades)
             ScheduleNextTrade();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check and update trailing stop                                  |
+//+------------------------------------------------------------------+
+void CheckTrailingStop()
+{
+    if(!PositionSelectByTicket(currentPositionTicket))
+        return;
+    
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    double currentSL = PositionGetDouble(POSITION_SL);
+    double currentTP = PositionGetDouble(POSITION_TP);
+    bool isLong = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+    
+    double currentPrice = isLong ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                                  SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    
+    // Calculate pip value
+    double pipValue = _Point;
+    if(_Digits == 5 || _Digits == 3) pipValue *= 10;
+    
+    // Calculate profit in points
+    double profitPoints = 0;
+    if(isLong)
+        profitPoints = (currentPrice - openPrice) / pipValue;
+    else
+        profitPoints = (openPrice - currentPrice) / pipValue;
+    
+    // Check if we have enough profit to activate trailing
+    if(profitPoints >= TrailStartPoints)
+    {
+        double newSL = 0;
+        bool shouldUpdate = false;
+        
+        if(isLong)
+        {
+            // For BUY positions - trail below current price
+            double profitDistance = currentPrice - openPrice;
+            double trailDistance = profitDistance * (TrailPercent / 100.0);
+            newSL = currentPrice - trailDistance;
+            
+            // Only modify if new SL is higher than current one
+            if(newSL > currentSL)
+                shouldUpdate = true;
+        }
+        else
+        {
+            // For SELL positions - trail above current price
+            double profitDistance = openPrice - currentPrice;
+            double trailDistance = profitDistance * (TrailPercent / 100.0);
+            newSL = currentPrice + trailDistance;
+            
+            // Only modify if new SL is lower than current one (or no SL set)
+            if(newSL < currentSL || currentSL == 0)
+                shouldUpdate = true;
+        }
+        
+        // Update stop loss if needed
+        if(shouldUpdate)
+        {
+            newSL = NormalizeDouble(newSL, _Digits);
+            
+            MqlTradeRequest request;
+            MqlTradeResult result;
+            ZeroMemory(request);
+            ZeroMemory(result);
+            
+            request.action = TRADE_ACTION_SLTP;
+            request.position = currentPositionTicket;
+            request.symbol = _Symbol;
+            request.sl = newSL;
+            request.tp = currentTP;
+            
+            if(OrderSend(request, result))
+            {
+                if(result.retcode == TRADE_RETCODE_DONE)
+                {
+                    Print("Trailing stop updated for ticket #", currentPositionTicket, 
+                          " - Profit: ", NormalizeDouble(profitPoints, 1), " pips, New SL: ", newSL,
+                          " (trailing ", TrailPercent, "% of profit)");
+                }
+                else
+                {
+                    Print("Failed to update trailing stop. Error code: ", result.retcode);
+                }
+            }
+            else
+            {
+                Print("OrderSend failed for trailing stop. Error: ", GetLastError());
+            }
+        }
     }
 }
