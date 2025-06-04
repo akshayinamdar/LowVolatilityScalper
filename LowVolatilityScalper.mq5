@@ -27,6 +27,12 @@ input int StopLossPips = 10;                 // Stop loss in pips
 input int VolatilityPeriod = 30;             // Minutes to check volatility
 input int VolatilityRange = 15;              // Maximum range in pips
 
+input group "Moving Average Settings"
+input int MAPeriod = 50;                     // Moving Average period
+input ENUM_MA_METHOD MAMethod = MODE_EMA;    // Moving Average method
+input ENUM_TIMEFRAMES MATimeframe = PERIOD_M15; // Timeframe for MA calculation
+input bool EnableMASignal = true;           // Enable moving average signals
+
 input group "Risk Management"
 input double MaxRiskPercent = 2.0;           // Maximum risk per trade (%)
 
@@ -165,14 +171,31 @@ void CheckMarketConditions()
         
     if(GetCurrentPositionCount() >= MaxConcurrentTrades)
         return;
-    
-    // Check volatility conditions
+      // Check volatility conditions
     if(IsLowVolatilityPeriod())
     {
-        // Random direction selection
-        bool isLong = (MathRand() % 2 == 0);
-        
-        PlaceTrade(isLong);
+        // Use moving average strategy instead of random
+        if(EnableMASignal)
+        {
+            int direction = GetMASignal();
+            if(direction != 0) // 0 = no signal, 1 = long, -1 = short
+            {
+                bool isLong = (direction == 1);
+                PlaceTrade(isLong);
+                Print("Low volatility detected. MA signal: ", isLong ? "LONG" : "SHORT");
+            }
+            else
+            {
+                Print("Low volatility detected but no clear MA signal");
+            }
+        }
+        else
+        {
+            // Fallback to random direction if MA signal is disabled
+            bool isLong = (MathRand() % 2 == 0);
+            PlaceTrade(isLong);
+            Print("Low volatility detected. Random direction selected: ", isLong ? "LONG" : "SHORT");
+        }
     }
 }
 
@@ -182,6 +205,7 @@ void CheckMarketConditions()
 bool IsLowVolatilityPeriod()
 {
     double high = 0, low = DBL_MAX;
+    int highIndex = -1, lowIndex = -1;  // Track which candles formed the range
     
     // Get high and low for the last VolatilityPeriod minutes
     MqlRates rates[];
@@ -192,13 +216,34 @@ bool IsLowVolatilityPeriod()
     {
         for(int i = 0; i < copied; i++)
         {
-            if(rates[i].high > high) high = rates[i].high;
-            if(rates[i].low < low) low = rates[i].low;
+            if(rates[i].high > high) 
+            {
+                high = rates[i].high;
+                highIndex = i;  // Store index of candle with highest high
+            }
+            if(rates[i].low < low) 
+            {
+                low = rates[i].low;
+                lowIndex = i;   // Store index of candle with lowest low
+            }
         }
     }
       // Calculate range in pips
     double rangePips = (high - low) / _Point;
     if(_Digits == 5 || _Digits == 3) rangePips /= 10;
+    
+    Print("Volatility Check - Range High: ", high, " (index ", highIndex, 
+          "), Range Low: ", low, " (index ", lowIndex, "), Range Pips: ", rangePips);
+    
+    // NEW CHECK: Verify range high/low formed at least 3 candles ago
+    bool rangeAgeValid = (highIndex >= 3 && lowIndex >= 3);
+    
+    if(!rangeAgeValid)
+    {
+        Print("Range is too recent - high formed ", highIndex, " candles ago, low formed ", 
+              lowIndex, " candles ago. Need at least 3 candles of distance.");
+        return false;
+    }
     
     // Check if range is within our volatility threshold
     if(rangePips <= VolatilityRange)
@@ -209,7 +254,6 @@ bool IsLowVolatilityPeriod()
         double upperBoundary = high - (rangeWidth * 0.2); // 20% from top
         double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          
-        Print("Volatility Check - Range High: ", high, ", Range Low: ", low, ", Range Pips: ", rangePips);
         Print("Middle 60% Boundaries - Lower: ", lowerBoundary, ", Upper: ", upperBoundary, ", Current Price: ", currentPrice);
         // Check if price is within the middle 60%
         bool isWithinMiddle60Percent = (currentPrice >= lowerBoundary && currentPrice <= upperBoundary);
@@ -229,25 +273,69 @@ void PlaceTrade(bool isLong)
     MqlTradeResult result;
     ZeroMemory(request);
     ZeroMemory(result);
-    
-    double price = isLong ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+      double price = isLong ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
                            SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Get symbol point and minimum stops
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    int minStopLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
     
     // Calculate stop loss and take profit
     double pipValue = _Point;
     if(_Digits == 5 || _Digits == 3) pipValue *= 10;
     
+    // Ensure we have reasonable minimum distances
+    double minDistance = MathMax(minStopLevel * point, 1 * pipValue); // At least 1 pip
+    
+    // Calculate stop loss and take profit distances  
+    double slDistance = MathMax(StopLossPips * pipValue, minDistance * 2); // Ensure SL is at least 2x min distance
+    double tpDistance = MathMax(ProfitTargetPips * pipValue, minDistance); // Ensure TP is at least min distance
+    
     double stopLoss, takeProfit;
     
     if(isLong)
     {
-        stopLoss = price - (StopLossPips * pipValue);
-        takeProfit = price + (ProfitTargetPips * pipValue);
+        // Long position: SL below price, TP above price
+        stopLoss = price - slDistance;
+        takeProfit = price + tpDistance;
     }
     else
     {
-        stopLoss = price + (StopLossPips * pipValue);
-        takeProfit = price - (ProfitTargetPips * pipValue);
+        // Short position: SL above price, TP below price  
+        stopLoss = price + slDistance;
+        takeProfit = price - tpDistance;
+    }
+    
+    // Normalize prices
+    stopLoss = NormalizeDouble(stopLoss, _Digits);
+    takeProfit = NormalizeDouble(takeProfit, _Digits);
+    price = NormalizeDouble(price, _Digits);
+    
+    // Validate that stops are properly positioned
+    bool validStops = true;
+    if(isLong)
+    {
+        if(stopLoss >= price || takeProfit <= price)
+            validStops = false;
+    }
+    else
+    {
+        if(stopLoss <= price || takeProfit >= price)
+            validStops = false;
+    }
+    
+    // Check minimum distances are respected
+    double slDistanceCheck = MathAbs(price - stopLoss);
+    double tpDistanceCheck = MathAbs(price - takeProfit);
+    
+    if(slDistanceCheck < minDistance || tpDistanceCheck < minDistance)
+        validStops = false;
+    
+    if(!validStops)
+    {
+        Print("Trade cancelled - Invalid stop levels. Price: ", price, 
+              ", SL: ", stopLoss, ", TP: ", takeProfit, ", Min Distance: ", minDistance);
+        return;
     }
     
     // Prepare trade request
@@ -259,21 +347,25 @@ void PlaceTrade(bool isLong)
     request.sl = stopLoss;
     request.tp = takeProfit;
     request.deviation = 3;
-    request.magic = 12345;
-    request.comment = "LowVolScalper";
+    request.magic = 12345;    request.comment = "LowVolScalper";
+    
+    Print("Trade attempt - Direction: ", isLong ? "LONG" : "SHORT",
+          ", Price: ", price, ", SL: ", stopLoss, ", TP: ", takeProfit,
+          ", SL Distance: ", slDistanceCheck, ", TP Distance: ", tpDistanceCheck,
+          ", Min Distance: ", minDistance);
     
     // Send order
     if(OrderSend(request, result))
-    {
-        if(result.retcode == TRADE_RETCODE_DONE)
+    {        if(result.retcode == TRADE_RETCODE_DONE)
         {
             dailyTradeCount++;
             Print("Trade placed successfully. Direction: ", isLong ? "LONG" : "SHORT",
-                  ", Price: ", price, ", Daily count: ", dailyTradeCount);
+                  ", Price: ", price, ", SL: ", stopLoss, ", TP: ", takeProfit, 
+                  ", Daily count: ", dailyTradeCount);
         }
         else
         {
-            Print("Trade failed. Return code: ", result.retcode);
+            Print("Trade failed. Return code: ", result.retcode, " - ", result.comment);
         }
     }
     else
@@ -353,8 +445,7 @@ void ManageTrailingStops()
                 {
                     profitPips = (openPrice - currentPrice) / pipValue;
                 }
-                
-                // Only apply trailing stop if we've reached activation threshold
+                  // Only apply trailing stop if we've reached activation threshold
                 if(profitPips >= TrailingActivationPips)
                 {
                     // Calculate trailing distance as percentage of profit
@@ -368,8 +459,8 @@ void ManageTrailingStops()
                     
                     if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
                     {
-                        // For buy positions, trail below the current price
-                        newSL = currentPrice - (trailingDistancePips * pipValue);
+                        // For buy positions, trail at percentage of profit from entry price
+                        newSL = openPrice + (profitPips * (TrailingPercent / 100.0) * pipValue);
                         
                         // Only modify if the new SL is higher than the current one
                         if(newSL > currentSL)
@@ -377,8 +468,8 @@ void ManageTrailingStops()
                     }
                     else
                     {
-                        // For sell positions, trail above the current price
-                        newSL = currentPrice + (trailingDistancePips * pipValue);
+                        // For sell positions, trail at percentage of profit from entry price
+                        newSL = openPrice - (profitPips * (TrailingPercent / 100.0) * pipValue);
                         
                         // Only modify if the new SL is lower than the current one
                         if(newSL < currentSL || currentSL == 0)
@@ -433,4 +524,54 @@ bool ModifyStopLoss(ulong ticket, double newSL)
     }
     
     return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get Moving Average Signal                                        |
+//+------------------------------------------------------------------+
+int GetMASignal()
+{
+    // Get Moving Average values
+    double maValues[];
+    ArraySetAsSeries(maValues, true);
+    
+    int maHandle = iMA(_Symbol, MATimeframe, MAPeriod, 0, MAMethod, PRICE_CLOSE);
+    if(maHandle == INVALID_HANDLE)
+    {
+        Print("Failed to create Moving Average indicator");
+        return 0; // No signal
+    }
+    
+    // Copy the indicator values
+    if(CopyBuffer(maHandle, 0, 0, 2, maValues) < 2)
+    {
+        Print("Failed to copy Moving Average data");
+        IndicatorRelease(maHandle);
+        return 0; // No signal
+    }
+    
+    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double currentMA = maValues[0];
+    
+    Print("Moving Average - MA Value: ", currentMA, ", Current Price: ", currentPrice);
+    
+    // Simple trend following signals
+    if(currentPrice > currentMA)
+    {
+        Print("MA signal: BUY (price above MA)");
+        IndicatorRelease(maHandle);
+        return 1; // Long signal
+    }
+    else if(currentPrice < currentMA)
+    {
+        Print("MA signal: SELL (price below MA)");
+        IndicatorRelease(maHandle);
+        return -1; // Short signal
+    }
+    else
+    {
+        Print("Price exactly at MA, no clear signal");
+        IndicatorRelease(maHandle);
+        return 0; // No signal
+    }
 }
