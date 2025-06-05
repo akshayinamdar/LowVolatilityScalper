@@ -158,6 +158,79 @@ bool IsWithinTradingHours()
 }
 
 //+------------------------------------------------------------------+
+//| Preload Moving Average indicator data                           |
+//+------------------------------------------------------------------+
+bool PreloadIndicatorData()
+{
+    int maHandle = iMA(_Symbol, MATimeframe, currentMAPeriod, 0, MAMethod, PRICE_CLOSE);
+    if(maHandle == INVALID_HANDLE)
+    {
+        Print("Preload: Failed to create MA indicator with period ", currentMAPeriod);
+        return false;
+    }
+    
+    Print("Preload: Created MA handle for period ", currentMAPeriod, ", attempting to load data...");
+    
+    // Wait for indicator calculation with multiple attempts
+    int attempts = 0;
+    int maxAttempts = 10;
+    bool dataReady = false;
+    
+    while(attempts < maxAttempts && !dataReady)
+    {
+        attempts++;
+        
+        // Check if indicator is calculated
+        int calculated = BarsCalculated(maHandle);
+        if(calculated <= 0)
+        {
+            Print("Preload: MA not calculated yet, attempt ", attempts, "/", maxAttempts);
+            Sleep(MathRand() % 400 + 100); // Random delay 100-500ms
+            continue;
+        }
+        
+        // Check if we have enough bars
+        int availableBars = iBars(_Symbol, MATimeframe);
+        if(availableBars < currentMAPeriod + 2)
+        {
+            Print("Preload: Insufficient bars. Need: ", currentMAPeriod + 2, ", Available: ", availableBars);
+            Sleep(200);
+            continue;
+        }
+        
+        // Try to copy a small amount of data to test readiness
+        double testValues[];
+        ArraySetAsSeries(testValues, true);
+        int copied = CopyBuffer(maHandle, 0, 0, 2, testValues);
+        
+        if(copied == 2 && testValues[0] != EMPTY_VALUE && testValues[0] > 0)
+        {
+            dataReady = true;
+            Print("Preload: MA data successfully loaded on attempt ", attempts, 
+                  ". Current MA value: ", testValues[0], ", Calculated bars: ", calculated);
+        }
+        else
+        {
+            Print("Preload: Data copy failed, attempt ", attempts, "/", maxAttempts, 
+                  ". Copied: ", copied, ", Value: ", (copied > 0 ? testValues[0] : 0));
+            Sleep(MathRand() % 400 + 100);
+        }
+    }
+    
+    // Clean up handle
+    IndicatorRelease(maHandle);
+    
+    if(!dataReady)
+    {
+        Print("Preload: Failed to load MA data after ", maxAttempts, " attempts");
+        return false;
+    }
+    
+    Print("Preload: Moving Average data successfully preloaded for period ", currentMAPeriod);
+    return true;
+}
+
+//+------------------------------------------------------------------+
 //| Check market conditions and place trade if criteria met         |
 //+------------------------------------------------------------------+
 void CheckMarketConditions()
@@ -171,30 +244,52 @@ void CheckMarketConditions()
         
     if(GetCurrentPositionCount() >= MaxConcurrentTrades)
         return;
-      // Check volatility conditions
+    
+    // Randomize MA period for better adaptability
+    currentMAPeriod = MathRand() % 21 + MAPeriod; // MAPeriod to MAPeriod+20
+    
+    // Preload MA data if MA signal is enabled
+    if(EnableMASignal)
+    {
+        if(!PreloadIndicatorData())
+        {
+            Print("CheckMarket: Failed to preload MA data, proceeding with fallback");
+        }
+        else
+        {
+            Print("CheckMarket: MA data successfully preloaded for period ", currentMAPeriod);
+        }
+    }
+        
+    // Check volatility conditions
     if(IsLowVolatilityPeriod())
     {
-        // Use moving average strategy instead of random
+        // Get direction signal (MA or random fallback)
+        int direction = 0;
+        
         if(EnableMASignal)
         {
-            int direction = GetMASignal();
-            if(direction != 0) // 0 = no signal, 1 = long, -1 = short
+            direction = GetMASignal();
+            if(direction == 0)
             {
-                bool isLong = (direction == 1);
-                PlaceTrade(isLong);
-                Print("Low volatility detected. MA signal: ", isLong ? "LONG" : "SHORT");
-            }
-            else
-            {
-                Print("Low volatility detected but no clear MA signal");
+                Print("No clear MA signal, using random direction as fallback");
+                direction = (MathRand() % 2 == 0) ? 1 : -1; // Random 1 or -1
             }
         }
         else
         {
-            // Fallback to random direction if MA signal is disabled
-            bool isLong = (MathRand() % 2 == 0);
+            // Use random direction when MA signal is disabled
+            direction = (MathRand() % 2 == 0) ? 1 : -1;
+            Print("MA signal disabled, using random direction: ", direction > 0 ? "LONG" : "SHORT");
+        }
+        
+        if(direction != 0) // Should always be true now
+        {
+            bool isLong = (direction == 1);
             PlaceTrade(isLong);
-            Print("Low volatility detected. Random direction selected: ", isLong ? "LONG" : "SHORT");
+            
+            string signalSource = EnableMASignal ? "MA signal" : "Random signal";
+            Print("Low volatility detected. ", signalSource, " (period ", currentMAPeriod, "): ", isLong ? "LONG" : "SHORT");
         }
     }
 }
@@ -534,24 +629,70 @@ int GetMASignal()
     // Get Moving Average values
     double maValues[];
     ArraySetAsSeries(maValues, true);
-    
-    int maHandle = iMA(_Symbol, MATimeframe, MAPeriod, 0, MAMethod, PRICE_CLOSE);
+      int maHandle = iMA(_Symbol, MATimeframe, MAPeriod, 0, MAMethod, PRICE_CLOSE);
     if(maHandle == INVALID_HANDLE)
     {
         Print("Failed to create Moving Average indicator");
         return 0; // No signal
     }
     
-    // Copy the indicator values
-    if(CopyBuffer(maHandle, 0, 0, 2, maValues) < 2)
+    // Wait for indicator to be ready and try multiple times
+    int attempts = 0;
+    int maxAttempts = 5;
+    
+    while(attempts < maxAttempts)
     {
-        Print("Failed to copy Moving Average data");
+        // Check if indicator is ready
+        if(BarsCalculated(maHandle) <= 0)
+        {
+            Print("MA indicator not ready yet, attempt ", attempts + 1);
+            Sleep(100); // Wait 100ms
+            attempts++;
+            continue;
+        }
+        
+        // Ensure we have enough bars
+        int bars = iBars(_Symbol, MATimeframe);
+        if(bars < MAPeriod + 2)
+        {
+            Print("Not enough bars for MA calculation. Need: ", MAPeriod + 2, ", Have: ", bars);
+            IndicatorRelease(maHandle);
+            return 0;
+        }
+        
+        // Try to copy the indicator values
+        int copied = CopyBuffer(maHandle, 0, 0, 2, maValues);
+        if(copied == 2)
+        {
+            // Success - we have the data
+            break;
+        }
+        else
+        {
+            Print("Failed to copy MA data, attempt ", attempts + 1, ", copied: ", copied, ", error: ", GetLastError());
+            Sleep(100);
+            attempts++;
+        }
+    }
+    
+    // If we couldn't get the data after all attempts
+    if(attempts >= maxAttempts)
+    {
+        Print("Failed to get MA data after ", maxAttempts, " attempts");
         IndicatorRelease(maHandle);
         return 0; // No signal
     }
     
     double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double currentMA = maValues[0];
+    
+    // Validate the MA value
+    if(currentMA <= 0 || currentMA == EMPTY_VALUE)
+    {
+        Print("Invalid MA value: ", currentMA);
+        IndicatorRelease(maHandle);
+        return 0;
+    }
     
     Print("Moving Average - MA Value: ", currentMA, ", Current Price: ", currentPrice);
     
